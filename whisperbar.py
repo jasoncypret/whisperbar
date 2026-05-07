@@ -449,7 +449,9 @@ class WhisperBarApp(AppKit.NSObject):
             except OSError:
                 pass
 
-        subprocess.run(["pbcopy"], input=text.encode(), check=False)
+        pb = AppKit.NSPasteboard.generalPasteboard()
+        pb.clearContents()
+        pb.setString_forType_(text, AppKit.NSPasteboardTypeString)
         Foundation.NSOperationQueue.mainQueue().addOperationWithBlock_(lambda: self._done(text))
 
     @objc.python_method
