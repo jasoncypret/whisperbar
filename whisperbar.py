@@ -248,14 +248,15 @@ def _download_model(name: str) -> bool:
 class WhisperBarApp(AppKit.NSObject):
 
     def applicationDidFinishLaunching_(self, _n):
-        self._recording  = False
+        self._recording   = False
+        self._processing  = False   # True while transcription is in-flight
         self._record_proc = None
-        self._temp_wav   = None
-        self._spin_angle = 0
-        self._spin_timer = None
-        self._pulse_idx  = 0
+        self._temp_wav    = None
+        self._spin_angle  = 0
+        self._spin_timer  = None
+        self._pulse_idx   = 0
         self._pulse_timer = None
-        self._toast_win  = None
+        self._toast_win   = None
         self._toast_timer = None
 
         # Load or create config
@@ -347,6 +348,8 @@ class WhisperBarApp(AppKit.NSObject):
         )
         if right:
             self._item.popUpStatusItemMenu_(self._menu)
+        elif self._processing:
+            pass  # ignore clicks while transcription is in-flight
         elif self._recording:
             self._stop_recording()
         else:
@@ -413,7 +416,8 @@ class WhisperBarApp(AppKit.NSObject):
 
     @objc.python_method
     def _stop_recording(self):
-        self._recording = False
+        self._recording  = False
+        self._processing = True
         if self._pulse_timer:
             self._pulse_timer.invalidate()
             self._pulse_timer = None
@@ -450,6 +454,7 @@ class WhisperBarApp(AppKit.NSObject):
 
     @objc.python_method
     def _done(self, text):
+        self._processing = False
         if self._spin_timer:
             self._spin_timer.invalidate()
             self._spin_timer = None
