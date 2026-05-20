@@ -496,7 +496,7 @@ class WhisperBarApp(AppKit.NSObject):
             with open(out_file, "w") as f_out:
                 proc2 = subprocess.Popen(
                     ["nice", "-n", "10", self._cfg["whisper_cli"], "-m", self._cfg["model"],
-                     "-f", wav, "--no-timestamps", "-nt", "--threads", "4"],
+                     "-f", wav, "--no-timestamps", "-nt"],
                     stdout=f_out,
                     stderr=subprocess.DEVNULL,
                 )
