@@ -450,28 +450,14 @@ class WhisperBarApp(AppKit.NSObject):
 
     @objc.python_method
     def _stop_recording(self):
-        self._recording  = False
+        # Only update UI state on the main thread — immediately responsive
+        self._recording = False
         if self._pulse_timer:
             self._pulse_timer.invalidate()
             self._pulse_timer = None
-        if self._record_proc:
-            self._record_proc.terminate()
-            self._record_proc.wait()
-
-        # If another whisper-cli is already running (e.g. OpenClaw meeting pipeline),
-        # warn and bail rather than freezing the UI under CPU contention.
-        other_whisper = subprocess.run(
-            ["pgrep", "-f", "whisper-cli"],
-            capture_output=True,
-        ).returncode == 0
-        if other_whisper:
-            _crossfade(self._item.button(), self._icon_idle)
-            self._item.button().setToolTip_("WhisperBar — click to record")
-            self._show_toast(
-                "A background transcription is running. Try again in a moment.",
-                title="Transcription busy",
-            )
-            return
+        proc = self._record_proc
+        self._record_proc = None
+        wav = self._temp_wav
 
         self._processing = True
         self._spin_angle = 0
@@ -480,29 +466,74 @@ class WhisperBarApp(AppKit.NSObject):
             SPIN_INT, self, "spinTick:", None, True
         )
         self._item.button().setToolTip_("Transcribing…")
-        threading.Thread(target=self._transcribe, daemon=True).start()
+
+        # Everything blocking goes to a background thread
+        threading.Thread(target=self._stop_and_transcribe, args=(proc, wav), daemon=True).start()
 
     @objc.python_method
-    def _transcribe(self):
-        try:
-            r = subprocess.run(
-                ["nice", "-n", "10", self._cfg["whisper_cli"], "-m", self._cfg["model"],
-                 "-f", self._temp_wav, "--no-timestamps", "-nt", "--threads", "4"],
-                capture_output=True, text=True, timeout=600,
+    def _stop_and_transcribe(self, proc, wav):
+        # Stop the recording process
+        if proc:
+            try:
+                proc.terminate()
+                proc.wait(timeout=10)
+            except Exception:
+                pass
+
+        # Check for competing whisper-cli before burning CPU
+        other_whisper = subprocess.run(["pgrep", "-f", "whisper-cli"], capture_output=True).returncode == 0
+        if other_whisper:
+            Foundation.NSOperationQueue.mainQueue().addOperationWithBlock_(
+                lambda: self._transcribe_blocked()
             )
-            text = r.stdout.strip() or r.stderr.strip() or "(no speech detected)"
+            return
+
+        # Write whisper output to a temp file — avoids piping large text through
+        # Python's subprocess buffers which holds the GIL and starves the UI
+        out_file = wav + ".txt"
+        text = "(no speech detected)"
+        try:
+            with open(out_file, "w") as f_out:
+                proc2 = subprocess.Popen(
+                    ["nice", "-n", "10", self._cfg["whisper_cli"], "-m", self._cfg["model"],
+                     "-f", wav, "--no-timestamps", "-nt", "--threads", "4"],
+                    stdout=f_out,
+                    stderr=subprocess.DEVNULL,
+                )
+            # Poll — releases GIL on every sleep so the UI stays alive
+            deadline = time.time() + 600
+            while proc2.poll() is None:
+                if time.time() > deadline:
+                    proc2.kill()
+                    raise TimeoutError("Transcription exceeded 10 minutes")
+                time.sleep(0.5)
+
+            if proc2.returncode == 0:
+                raw = Path(out_file).read_text(errors="replace").strip()
+                text = raw or "(no speech detected)"
         except Exception as exc:
             text = f"(error: {exc})"
         finally:
-            try:
-                os.unlink(self._temp_wav)
-            except OSError:
-                pass
+            for f in (wav, out_file):
+                try:
+                    os.unlink(f)
+                except OSError:
+                    pass
 
         pb = AppKit.NSPasteboard.generalPasteboard()
         pb.clearContents()
         pb.setString_forType_(text, AppKit.NSPasteboardTypeString)
         Foundation.NSOperationQueue.mainQueue().addOperationWithBlock_(lambda: self._done(text))
+
+    @objc.python_method
+    def _transcribe_blocked(self):
+        self._processing = False
+        if self._spin_timer:
+            self._spin_timer.invalidate()
+            self._spin_timer = None
+        _crossfade(self._item.button(), self._icon_idle)
+        self._item.button().setToolTip_("WhisperBar — click to record")
+        self._show_toast("A background transcription is running. Try again in a moment.", title="Transcription busy")
 
     @objc.python_method
     def _done(self, text):
