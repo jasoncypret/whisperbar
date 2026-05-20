@@ -15,6 +15,8 @@ import tempfile
 import threading
 from pathlib import Path
 
+import time
+
 import AppKit
 import Foundation
 import Quartz
@@ -258,6 +260,7 @@ class WhisperBarApp(AppKit.NSObject):
         self._pulse_timer = None
         self._toast_win   = None
         self._toast_timer = None
+        self._last_text   = None    # Last transcript text for re-copy
 
         # Load or create config
         cfg = load_config()
@@ -292,11 +295,12 @@ class WhisperBarApp(AppKit.NSObject):
     def _build_menu(self):
         menu = AppKit.NSMenu.alloc().init()
 
-        # Last transcript
+        # Last transcript — clickable to re-copy
         self._last_item = AppKit.NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
-            "Last: —", None, ""
+            "Last: —", "copyLast:", ""
         )
-        self._last_item.setEnabled_(False)
+        self._last_item.setTarget_(self)
+        self._last_item.setEnabled_(self._last_text is not None)
         menu.addItem_(self._last_item)
         menu.addItem_(AppKit.NSMenuItem.separatorItem())
 
@@ -397,6 +401,14 @@ class WhisperBarApp(AppKit.NSObject):
     def openConfig_(self, _s):
         subprocess.run(["open", str(CONFIG_FILE)])
 
+    def copyLast_(self, _s):
+        if not self._last_text:
+            return
+        pb = AppKit.NSPasteboard.generalPasteboard()
+        pb.clearContents()
+        pb.setString_forType_(self._last_text, AppKit.NSPasteboardTypeString)
+        self._show_toast(self._last_text, title="Re-copied to clipboard")
+
     # ── Python helpers ─────────────────────────────────────────────────────────
 
     @objc.python_method
@@ -411,19 +423,57 @@ class WhisperBarApp(AppKit.NSObject):
         self._temp_wav = tempfile.mktemp(suffix=".wav")
         self._record_proc = subprocess.Popen(
             [self._cfg["sox"], "-d", self._temp_wav, "rate", "16000", "channels", "1"],
-            stderr=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
         )
+        # Check if sox started successfully in a background thread — never block the RunLoop
+        threading.Thread(target=self._check_sox_started, daemon=True).start()
+
+    @objc.python_method
+    def _check_sox_started(self):
+        time.sleep(0.8)
+        if self._record_proc and self._record_proc.poll() is not None:
+            stderr_out = self._record_proc.stderr.read().decode(errors="replace").strip()
+            msg = "Mic is in use by another app" if "busy" in stderr_out.lower() or "resource" in stderr_out.lower() else f"Could not open mic: {stderr_out[:120] or 'unknown error'}"
+            Foundation.NSOperationQueue.mainQueue().addOperationWithBlock_(
+                lambda: self._abort_recording(msg)
+            )
+
+    @objc.python_method
+    def _abort_recording(self, msg):
+        if self._pulse_timer:
+            self._pulse_timer.invalidate()
+            self._pulse_timer = None
+        self._recording = False
+        _crossfade(self._item.button(), self._icon_idle)
+        self._item.button().setToolTip_("WhisperBar — click to record")
+        self._show_toast(msg, title="Recording failed")
 
     @objc.python_method
     def _stop_recording(self):
         self._recording  = False
-        self._processing = True
         if self._pulse_timer:
             self._pulse_timer.invalidate()
             self._pulse_timer = None
         if self._record_proc:
             self._record_proc.terminate()
             self._record_proc.wait()
+
+        # If another whisper-cli is already running (e.g. OpenClaw meeting pipeline),
+        # warn and bail rather than freezing the UI under CPU contention.
+        other_whisper = subprocess.run(
+            ["pgrep", "-f", "whisper-cli"],
+            capture_output=True,
+        ).returncode == 0
+        if other_whisper:
+            _crossfade(self._item.button(), self._icon_idle)
+            self._item.button().setToolTip_("WhisperBar — click to record")
+            self._show_toast(
+                "A background transcription is running. Try again in a moment.",
+                title="Transcription busy",
+            )
+            return
+
+        self._processing = True
         self._spin_angle = 0
         _crossfade(self._item.button(), self._icon_load)
         self._spin_timer = Foundation.NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
@@ -436,9 +486,9 @@ class WhisperBarApp(AppKit.NSObject):
     def _transcribe(self):
         try:
             r = subprocess.run(
-                [self._cfg["whisper_cli"], "-m", self._cfg["model"],
-                 "-f", self._temp_wav, "--no-timestamps", "-nt"],
-                capture_output=True, text=True, timeout=120,
+                ["nice", "-n", "10", self._cfg["whisper_cli"], "-m", self._cfg["model"],
+                 "-f", self._temp_wav, "--no-timestamps", "-nt", "--threads", "4"],
+                capture_output=True, text=True, timeout=600,
             )
             text = r.stdout.strip() or r.stderr.strip() or "(no speech detected)"
         except Exception as exc:
@@ -457,6 +507,7 @@ class WhisperBarApp(AppKit.NSObject):
     @objc.python_method
     def _done(self, text):
         self._processing = False
+        self._last_text  = text
         if self._spin_timer:
             self._spin_timer.invalidate()
             self._spin_timer = None
@@ -465,10 +516,11 @@ class WhisperBarApp(AppKit.NSObject):
         self._last_item.setTitle_(
             "Last: " + text[:80] + ("…" if len(text) > 80 else "")
         )
+        self._last_item.setEnabled_(True)
         self._show_toast(text)
 
     @objc.python_method
-    def _show_toast(self, text):
+    def _show_toast(self, text, title="Copied to clipboard"):
         try:
             if self._toast_timer:
                 self._toast_timer.invalidate()
@@ -516,7 +568,7 @@ class WhisperBarApp(AppKit.NSObject):
             blur.layer().setShadowRadius_(16.0)
             win.setContentView_(blur)
 
-            title_f = AppKit.NSTextField.labelWithString_("Copied to clipboard")
+            title_f = AppKit.NSTextField.labelWithString_(title)
             title_f.setFrame_(AppKit.NSMakeRect(16, TOAST_H - 30, TOAST_W - 32, 18))
             title_f.setTextColor_(AppKit.NSColor.whiteColor())
             title_f.setFont_(AppKit.NSFont.boldSystemFontOfSize_(13))
