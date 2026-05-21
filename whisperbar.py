@@ -261,6 +261,7 @@ class WhisperBarApp(AppKit.NSObject):
         self._toast_win   = None
         self._toast_timer = None
         self._last_text   = None    # Last transcript text for re-copy
+        self._history     = self._load_history()  # Persistent transcript history
 
         # Load or create config
         cfg = load_config()
@@ -295,13 +296,28 @@ class WhisperBarApp(AppKit.NSObject):
     def _build_menu(self):
         menu = AppKit.NSMenu.alloc().init()
 
-        # Last transcript — clickable to re-copy
-        self._last_item = AppKit.NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
-            "Last: —", "copyLast:", ""
-        )
-        self._last_item.setTarget_(self)
-        self._last_item.setEnabled_(self._last_text is not None)
-        menu.addItem_(self._last_item)
+        # Recent transcripts — up to 5, each clickable to re-copy
+        if self._history:
+            for i, entry in enumerate(self._history[:5]):
+                preview = entry["text"][:60].replace("\n", " ")
+                if len(entry["text"]) > 60:
+                    preview += "…"
+                label = f"{i + 1}. {preview}"
+                item = AppKit.NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+                    label, "copyHistoryItem:", ""
+                )
+                item.setTarget_(self)
+                item.setRepresentedObject_(entry["text"])
+                menu.addItem_(item)
+        else:
+            placeholder = AppKit.NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+                "No recent transcripts", None, ""
+            )
+            placeholder.setEnabled_(False)
+            menu.addItem_(placeholder)
+
+        # Keep a reference to the first item for quick title updates
+        self._last_item = menu.itemAtIndex_(0)
         menu.addItem_(AppKit.NSMenuItem.separatorItem())
 
         # Settings submenu
@@ -401,13 +417,33 @@ class WhisperBarApp(AppKit.NSObject):
     def openConfig_(self, _s):
         subprocess.run(["open", str(CONFIG_FILE)])
 
-    def copyLast_(self, _s):
-        if not self._last_text:
+    def copyHistoryItem_(self, sender):
+        text = sender.representedObject()
+        if not text:
             return
         pb = AppKit.NSPasteboard.generalPasteboard()
         pb.clearContents()
-        pb.setString_forType_(self._last_text, AppKit.NSPasteboardTypeString)
-        self._show_toast(self._last_text, title="Re-copied to clipboard")
+        pb.setString_forType_(text, AppKit.NSPasteboardTypeString)
+        self._show_toast(text, title="Re-copied to clipboard")
+
+    @objc.python_method
+    def _load_history(self) -> list:
+        history_file = CONFIG_DIR / "history.json"
+        if history_file.exists():
+            try:
+                return json.loads(history_file.read_text())
+            except Exception:
+                pass
+        return []
+
+    @objc.python_method
+    def _save_history(self) -> None:
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        history_file = CONFIG_DIR / "history.json"
+        try:
+            history_file.write_text(json.dumps(self._history[:50], indent=2))
+        except Exception:
+            pass
 
     # ── Python helpers ─────────────────────────────────────────────────────────
 
@@ -539,15 +575,17 @@ class WhisperBarApp(AppKit.NSObject):
     def _done(self, text):
         self._processing = False
         self._last_text  = text
+        # Prepend to history, keep last 50
+        from datetime import datetime
+        self._history.insert(0, {"text": text, "ts": datetime.now().strftime("%Y-%m-%d %H:%M")})
+        self._history = self._history[:50]
+        self._save_history()
         if self._spin_timer:
             self._spin_timer.invalidate()
             self._spin_timer = None
         _crossfade(self._item.button(), self._icon_idle)
         self._item.button().setToolTip_("WhisperBar — click to record")
-        self._last_item.setTitle_(
-            "Last: " + text[:80] + ("…" if len(text) > 80 else "")
-        )
-        self._last_item.setEnabled_(True)
+        self._build_menu()
         self._show_toast(text)
 
     @objc.python_method
