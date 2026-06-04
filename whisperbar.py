@@ -458,7 +458,7 @@ class WhisperBarApp(AppKit.NSObject):
         self._item.button().setToolTip_("Recording… click to stop")
         self._temp_wav = tempfile.mktemp(suffix=".wav")
         self._record_proc = subprocess.Popen(
-            [self._cfg["sox"], "-d", self._temp_wav, "rate", "16000", "channels", "1"],
+            [self._cfg["sox"], "-q", "-d", self._temp_wav, "rate", "16000", "channels", "1"],
             stderr=subprocess.PIPE,
         )
         # Check if sox started successfully in a background thread — never block the RunLoop
