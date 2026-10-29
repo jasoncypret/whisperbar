@@ -11,7 +11,6 @@ import math
 import os
 import subprocess
 import sys
-import tempfile
 import threading
 from pathlib import Path
 
@@ -28,11 +27,15 @@ import cairosvg
 ASSETS_DIR = Path(__file__).parent / "assets"
 CONFIG_DIR = Path.home() / ".config" / "whisperbar"
 CONFIG_FILE = CONFIG_DIR / "config.json"
+RECORDINGS_DIR = CONFIG_DIR / "recordings"
+KEEP_RECORDINGS = 20   # Most recent WAVs kept on disk for re-transcription
 
 # ── Defaults ───────────────────────────────────────────────────────────────────
 
 DEFAULT_WHISPER_CLI = "/opt/homebrew/bin/whisper-cli"
 DEFAULT_SOX = "/opt/homebrew/bin/sox"
+# Silero VAD splits long recordings on silence so whisper doesn't drop sections
+DEFAULT_VAD_MODEL = "~/.cache/whisper-cpp/ggml-silero-v5.1.2.bin"
 
 MODEL_OPTIONS = {
     "tiny":   "~/.cache/whisper-cpp/ggml-tiny.bin",
@@ -245,6 +248,17 @@ def _download_model(name: str) -> bool:
     return result.returncode == 0
 
 
+def _prune_recordings() -> None:
+    """Keep only the KEEP_RECORDINGS most recent WAVs."""
+    if not RECORDINGS_DIR.exists():
+        return
+    for old in sorted(RECORDINGS_DIR.glob("*.wav"))[:-KEEP_RECORDINGS]:
+        try:
+            old.unlink()
+        except OSError:
+            pass
+
+
 # ── Main app ───────────────────────────────────────────────────────────────────
 
 class WhisperBarApp(AppKit.NSObject):
@@ -318,6 +332,18 @@ class WhisperBarApp(AppKit.NSObject):
 
         # Keep a reference to the first item for quick title updates
         self._last_item = menu.itemAtIndex_(0)
+        menu.addItem_(AppKit.NSMenuItem.separatorItem())
+
+        retranscribe = AppKit.NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            "Re-transcribe last recording", "retranscribeLast:", ""
+        )
+        retranscribe.setTarget_(self)
+        menu.addItem_(retranscribe)
+        open_recs = AppKit.NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+            "Open recordings folder", "openRecordings:", ""
+        )
+        open_recs.setTarget_(self)
+        menu.addItem_(open_recs)
         menu.addItem_(AppKit.NSMenuItem.separatorItem())
 
         # Settings submenu
@@ -417,6 +443,20 @@ class WhisperBarApp(AppKit.NSObject):
     def openConfig_(self, _s):
         subprocess.run(["open", str(CONFIG_FILE)])
 
+    def openRecordings_(self, _s):
+        RECORDINGS_DIR.mkdir(parents=True, exist_ok=True)
+        subprocess.run(["open", str(RECORDINGS_DIR)])
+
+    def retranscribeLast_(self, _s):
+        if self._recording or self._processing:
+            return
+        wavs = sorted(RECORDINGS_DIR.glob("*.wav")) if RECORDINGS_DIR.exists() else []
+        if not wavs:
+            self._show_toast("No saved recordings yet.", title="Nothing to re-transcribe")
+            return
+        self._begin_processing()
+        threading.Thread(target=self._stop_and_transcribe, args=(None, str(wavs[-1])), daemon=True).start()
+
     def copyHistoryItem_(self, sender):
         text = sender.representedObject()
         if not text:
@@ -456,7 +496,9 @@ class WhisperBarApp(AppKit.NSObject):
             PULSE_INT, self, "pulseTick:", None, True
         )
         self._item.button().setToolTip_("Recording… click to stop")
-        self._temp_wav = tempfile.mktemp(suffix=".wav")
+        RECORDINGS_DIR.mkdir(parents=True, exist_ok=True)
+        from datetime import datetime
+        self._temp_wav = str(RECORDINGS_DIR / f"{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.wav")
         self._record_proc = subprocess.Popen(
             [self._cfg["sox"], "-q", "-d", self._temp_wav, "rate", "16000", "channels", "1"],
             stderr=subprocess.PIPE,
@@ -495,6 +537,13 @@ class WhisperBarApp(AppKit.NSObject):
         self._record_proc = None
         wav = self._temp_wav
 
+        self._begin_processing()
+
+        # Everything blocking goes to a background thread
+        threading.Thread(target=self._stop_and_transcribe, args=(proc, wav), daemon=True).start()
+
+    @objc.python_method
+    def _begin_processing(self):
         self._processing = True
         self._spin_angle = 0
         _crossfade(self._item.button(), self._icon_load)
@@ -502,9 +551,6 @@ class WhisperBarApp(AppKit.NSObject):
             SPIN_INT, self, "spinTick:", None, True
         )
         self._item.button().setToolTip_("Transcribing…")
-
-        # Everything blocking goes to a background thread
-        threading.Thread(target=self._stop_and_transcribe, args=(proc, wav), daemon=True).start()
 
     @objc.python_method
     def _stop_and_transcribe(self, proc, wav):
@@ -516,13 +562,16 @@ class WhisperBarApp(AppKit.NSObject):
             except Exception:
                 pass
 
-        # Check for competing whisper-cli before burning CPU
-        other_whisper = subprocess.run(["pgrep", "-f", "whisper-cli"], capture_output=True).returncode == 0
-        if other_whisper:
-            Foundation.NSOperationQueue.mainQueue().addOperationWithBlock_(
-                lambda: self._transcribe_blocked()
-            )
-            return
+        # Wait out a competing whisper-cli rather than burning CPU alongside it.
+        # The WAV is already saved, so nothing is lost if we give up.
+        wait_deadline = time.time() + 600
+        while subprocess.run(["pgrep", "-f", "whisper-cli"], capture_output=True).returncode == 0:
+            if time.time() > wait_deadline:
+                Foundation.NSOperationQueue.mainQueue().addOperationWithBlock_(
+                    lambda: self._transcribe_blocked()
+                )
+                return
+            time.sleep(2)
 
         # Write whisper output to a temp file — avoids piping large text through
         # Python's subprocess buffers which holds the GIL and starves the UI
@@ -530,9 +579,14 @@ class WhisperBarApp(AppKit.NSObject):
         text = "(no speech detected)"
         try:
             with open(out_file, "w") as f_out:
+                # -mc 0 stops prior-text context from derailing long recordings
+                cmd = ["nice", "-n", "10", self._cfg["whisper_cli"], "-m", self._cfg["model"],
+                       "-f", wav, "--no-timestamps", "-nt", "-mc", "0"]
+                vad_model = Path(self._cfg.get("vad_model", DEFAULT_VAD_MODEL)).expanduser()
+                if vad_model.exists():
+                    cmd += ["--vad", "-vm", str(vad_model)]
                 proc2 = subprocess.Popen(
-                    ["nice", "-n", "10", self._cfg["whisper_cli"], "-m", self._cfg["model"],
-                     "-f", wav, "--no-timestamps", "-nt"],
+                    cmd,
                     stdout=f_out,
                     stderr=subprocess.DEVNULL,
                 )
@@ -550,11 +604,11 @@ class WhisperBarApp(AppKit.NSObject):
         except Exception as exc:
             text = f"(error: {exc})"
         finally:
-            for f in (wav, out_file):
-                try:
-                    os.unlink(f)
-                except OSError:
-                    pass
+            try:
+                os.unlink(out_file)
+            except OSError:
+                pass
+            _prune_recordings()
 
         pb = AppKit.NSPasteboard.generalPasteboard()
         pb.clearContents()
@@ -569,7 +623,7 @@ class WhisperBarApp(AppKit.NSObject):
             self._spin_timer = None
         _crossfade(self._item.button(), self._icon_idle)
         self._item.button().setToolTip_("WhisperBar — click to record")
-        self._show_toast("A background transcription is running. Try again in a moment.", title="Transcription busy")
+        self._show_toast("Recording saved. Use \"Re-transcribe last recording\" once the other transcription finishes.", title="Transcription busy")
 
     @objc.python_method
     def _done(self, text):
